@@ -198,13 +198,12 @@ def call_vllm(url, model, prompt, max_tokens, sampling):
     return resp.json()["choices"][0]["message"]["content"]
 
 
-def cache_path(idx, sample_id, use_hint):
-    tag = "hint" if use_hint else "nohint"
-    return os.path.join(CACHE_DIR, f"{idx}__{sample_id}__{tag}.json")
+def cache_path(idx, sample_id):
+    return os.path.join(CACHE_DIR, f"{idx}__{sample_id}.json")
 
 
-def eval_sample_once(row, use_hint, sample_id):
-    path = cache_path(row.name, sample_id, use_hint)
+def eval_sample_once(row, sample_id):
+    path = cache_path(row.name, sample_id)
     if os.path.exists(path):
         with open(path) as f:
             result = json.load(f)
@@ -215,13 +214,10 @@ def eval_sample_once(row, use_hint, sample_id):
         return result
 
     prompt = row["prompt"].tolist()
-    if use_hint:
-        prompt[0]["content"] = f"{prompt[0]['content']}\n\nHINT:\n{row['hints']}"
-
     solution = call_vllm(URL, MODEL, prompt, MAX_TOKENS, SAMPLING)
     score    = compute_score(solution, row["reward_model"]["ground_truth"])
 
-    result = {"idx": row.name, "sample_id": sample_id, "use_hint": use_hint,
+    result = {"idx": row.name, "sample_id": sample_id,
               "acc": score["acc"], "pred": score["pred"], "solution": solution}
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(path, "w") as f:
@@ -229,46 +225,42 @@ def eval_sample_once(row, use_hint, sample_id):
     return result
 
 
-def run_eval(df, use_hint):
-    tasks = [(row, use_hint, s) for _, row in df.iterrows() for s in range(MAX_K)]
+def run_eval(df):
+    tasks = [(row, s) for _, row in df.iterrows() for s in range(MAX_K)]
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(eval_sample_once, *t): t for t in tasks}
-        for f in tqdm(as_completed(futures), total=len(futures), desc=f"hint={use_hint}"):
+        for f in tqdm(as_completed(futures), total=len(futures)):
             try:
                 results.append(f.result())
             except Exception as e:
-                _, row, sid = futures[f]
+                row, sid = futures[f]
                 results.append({"idx": row.name, "sample_id": sid, "acc": 0, "error": str(e)})
     return pd.DataFrame(results).sort_values(["idx", "sample_id"]).reset_index(drop=True)
+
 
 import numpy as np
 
 def pass_at_k(flat_df, k, n_trials=10):
     rng = np.random.default_rng(42)
     per_problem = [grp["acc"].values for _, grp in flat_df.groupby("idx")]
-    
+
     trial_scores = []
     for _ in range(n_trials):
         scores = [int(rng.choice(accs, size=k, replace=False).sum() > 0) for accs in per_problem]
         trial_scores.append(np.mean(scores))
-    
+
     return float(np.mean(trial_scores)), float(np.std(trial_scores))
+
 
 df = pd.read_parquet("train.parquet")
 df = df.sample(n=min(df.shape[0], N_SAMPLES), random_state=42)
 
-output = {}
-flat_dfs = {}
-for use_hint in [False, True]:
-    label   = "with_hint" if use_hint else "no_hint"
-    flat_df = run_eval(df, use_hint)
-    flat_dfs[label] = flat_df
+flat_df = run_eval(df)
+metrics = {}
+for k in K_VALUES:
+    mean, std = pass_at_k(flat_df, k)
+    metrics[f"pass@{k}"] = {"mean": mean, "std": std}
+    print(f"  pass@{k} = {mean:.4f} ± {std:.4f}")
 
-    print(f"\n[{label}]")
-    metrics = {}
-    for k in K_VALUES:
-        mean, std = pass_at_k(flat_df, k)
-        metrics[f"pass@{k}"] = {"mean": mean, "std": std}
-        print(f"  pass@{k} = {mean:.4f} ± {std:.4f}")
-    output[label] = {"metrics": metrics, "raw": flat_df.to_dict(orient="records")}
+output = {"metrics": metrics, "raw": flat_df.to_dict(orient="records")}
